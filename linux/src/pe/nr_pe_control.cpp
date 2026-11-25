@@ -1,4 +1,5 @@
 // See nr_pe_control.hpp.
+#include "nr_path_win.hpp"
 #include "nr_pe_control.hpp"
 #include "nr_pe_events.hpp"
 #include "nr_control_shared.hpp"
@@ -12,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -26,7 +28,7 @@ std::atomic<bool> g_tried{false};
 nr::control::Shared* shared() {
     if (g_shared || g_tried.exchange(true)) return g_shared;
     const std::string path = std::string(module_folder()) + "\\dlssnr-amd\\control.bin";
-    HANDLE file = CreateFileA(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    HANDLE file = nr::u8::create_file(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                               nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) return nullptr;
     HANDLE map = CreateFileMappingA(file, nullptr, PAGE_READWRITE, 0, sizeof(nr::control::Shared), nullptr);
@@ -79,6 +81,11 @@ std::atomic<bool> g_menu_open{false};
 std::atomic<DWORD> g_watch_thread{0};
 
 bool held() { return g_menu_open.load() && GetCurrentThreadId() != g_watch_thread.load(); }
+// [NRControl] PassOptiScalerKey = 1: OptiScaler's menu key (its OptiScaler.ini [Menu] ShortcutKey, Insert) still
+// reaches the game's window and OptiScaler while NR Control is open, so OptiScaler's menu opens and closes over
+// ours. 0 (default): NR Control keeps every key. The key, or 0 when off; watch() reads both files once a second.
+std::atomic<int> g_pass_vk{0};
+bool passed(int vk) { const int p = g_pass_vk.load(std::memory_order_relaxed); return p != 0 && vk == p; }
 
 BOOL WINAPI clip_cursor(const RECT* r) {
     {
@@ -104,11 +111,16 @@ BOOL WINAPI get_cursor_info(CURSORINFO* ci) {
     if (ok && ci && held()) ci->ptScreenPos = g_frozen;
     return ok;
 }
-SHORT WINAPI get_async_key_state(int vk) { return held() ? 0 : g_real_async(vk); }
-SHORT WINAPI get_key_state(int vk) { return held() ? 0 : g_real_keystate(vk); }
+SHORT WINAPI get_async_key_state(int vk) { return held() && !passed(vk) ? 0 : g_real_async(vk); }
+SHORT WINAPI get_key_state(int vk) { return held() && !passed(vk) ? 0 : g_real_keystate(vk); }
 BOOL WINAPI get_keyboard_state(BYTE* keys) {
     const BOOL ok = g_real_keyboard(keys);
-    if (ok && keys && held()) std::memset(keys, 0, 256);
+    if (ok && keys && held()) {
+        const int p = g_pass_vk.load(std::memory_order_relaxed);
+        const BYTE kept = p > 0 && p < 256 ? keys[p] : 0;
+        std::memset(keys, 0, 256);
+        if (p > 0 && p < 256) keys[p] = kept;
+    }
     return ok;
 }
 UINT WINAPI get_raw_input_data(HRAWINPUT h, UINT command, void* data, UINT* size, UINT header) {
@@ -119,7 +131,7 @@ UINT WINAPI get_raw_input_data(HRAWINPUT h, UINT command, void* data, UINT* size
             in->data.mouse.lLastX = in->data.mouse.lLastY = 0;
             in->data.mouse.usButtonFlags = 0;
             in->data.mouse.usButtonData = 0;
-        } else if (in->header.dwType == RIM_TYPEKEYBOARD) {
+        } else if (in->header.dwType == RIM_TYPEKEYBOARD && !passed(in->data.keyboard.VKey)) {
             in->data.keyboard.VKey = 0xFF;   // no key
             in->data.keyboard.MakeCode = 0;
             in->data.keyboard.Message = 0;
@@ -183,9 +195,14 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ++s->chars_written;
         }
         if (s->menu_open) {
-            // The menu has the keyboard and mouse: the game's window gets none of it.
-            if (msg == WM_INPUT) return DefWindowProcW(hwnd, msg, wp, lp);
-            if ((msg >= WM_KEYFIRST && msg <= WM_KEYLAST) || (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST)) return 0;
+            // The menu has the keyboard and mouse: the game's window gets none of it (but OptiScaler's menu key
+            // with PassOptiScalerKey on).
+            const bool pass = (msg == WM_KEYDOWN || msg == WM_KEYUP || msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP) &&
+                              passed(int(wp));
+            if (!pass) {
+                if (msg == WM_INPUT) return DefWindowProcW(hwnd, msg, wp, lp);
+                if ((msg >= WM_KEYFIRST && msg <= WM_KEYLAST) || (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST)) return 0;
+            }
         }
     }
     return CallWindowProcW(g_previous, hwnd, msg, wp, lp);
@@ -208,9 +225,32 @@ HWND game_window() {
     return f.best;
 }
 
+void read_pass_key() {   // [NRControl] PassOptiScalerKey and OptiScaler's [Menu] ShortcutKey, once a second
+    static ULONGLONG last = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (last && now - last < 1000) return;
+    last = now;
+    const std::string folder = module_folder();
+    char v[32] = {};
+    nr::u8::profile("NRControl", "PassOptiScalerKey", "0", v, sizeof v, folder + "\\dlssnr-amd.ini");
+    int vk = 0;
+    if (std::atoi(v) == 1 || !_stricmp(v, "true")) {
+        char k[32] = {};
+        nr::u8::profile("Menu", "ShortcutKey", "auto", k, sizeof k, folder + "\\OptiScaler.ini");
+        const std::string t = k;
+        vk = t.empty() || t == "auto" ? VK_INSERT : int(std::strtol(t.c_str(), nullptr, 0));
+        if (vk <= 0 || vk >= 256) vk = 0;
+    }
+    if (vk != g_pass_vk.exchange(vk)) {
+        if (vk) log("[nr] NR Control: OptiScaler's menu key (0x%02X) reaches OptiScaler while NR Control is open ([NRControl] PassOptiScalerKey)", vk);
+        else if (last) log("[nr] NR Control: every key stays with NR Control while it is open");
+    }
+}
+
 void watch() {
     g_watch_thread.store(GetCurrentThreadId());
     for (;;) {
+        read_pass_key();
         nr::control::Shared* s = g_shared;
         const bool open = s && s->menu_open != 0;
         if (s && open != g_menu_open.load()) menu_changed(open);
@@ -243,6 +283,13 @@ void watch() {
                 const bool focused = GetForegroundWindow() == g_window;
                 for (int vk = 1; vk < 256; ++vk)
                     if (focused && (GetAsyncKeyState(vk) & 0x8000)) keys[vk / 32] |= 1u << (vk % 32);
+                // the presses first (nr_control_shared.hpp `pressed`), then the keys: a key seen down has its press
+                static uint32_t last[8] = {};
+                for (int w = 0; w < 8; ++w) {
+                    if (const uint32_t now_down = keys[w] & ~last[w])
+                        InterlockedOr(reinterpret_cast<volatile LONG*>(&s->pressed[w]), LONG(now_down));
+                    last[w] = keys[w];
+                }
                 std::memcpy(s->keys, keys, sizeof keys);
                 POINT p{};
                 RECT r{};
@@ -401,8 +448,8 @@ void report(const Status& st) {
         if (std::find(g_frame_layers.begin(),g_frame_layers.end(),st.layer)==g_frame_layers.end()) g_frame_layers.push_back(st.layer);
     }
     if (nr::control::LayerStatus* r = row_of(s, st.layer, true)) {   // a layer's row: every run
-        r->state = !st.nr_on ? 3u : st.building && st.gpu_ms <= 0.f ? 2u : st.waiting ? 3u : 1u;
-        if (!st.nr_on) std::snprintf(r->note, sizeof r->note, "NR is off (toggle key)");
+        r->state = !st.nr_on ? 3u : st.building && !st.ran ? 2u : st.waiting ? 3u : 1u;
+        if (!st.nr_on) std::snprintf(r->note, sizeof r->note, "%s", NR_N("NR is off (toggle key)"));
         else if (st.waiting) std::snprintf(r->note, sizeof r->note, "%s", st.waiting_why.c_str());
         else r->note[0] = 0;
         r->net = st.net_running < 0 ? nr::control::kNoNet : uint32_t(st.net_running);
@@ -410,8 +457,10 @@ void report(const Status& st) {
         r->nr_width = st.nr_width; r->nr_height = st.nr_height;
         r->passes = st.passes;
         r->fast_passes = st.fast_passes; r->motion = st.motion;
-        if (r->state == 1u && st.fast_fallback)
-            std::snprintf(r->note, sizeof r->note, "Extrapolation: no motion vectors");
+        if (r->state == 1u && st.il_missing)
+            std::snprintf(r->note, sizeof r->note, "%s", nr::control::il_missing_note(st.il_missing));
+        else if (r->state == 1u && st.fast_fallback)
+            std::snprintf(r->note, sizeof r->note, "%s", nr::control::fast_fallback_note(st.fast_fallback_spatial));
         r->gpu_ms = st.gpu_ms; r->network_ms = st.network_ms;
         r->updated = uint32_t(now);
         nr::pe::events::layer_state(st.layer, r->state, r->note);
@@ -452,9 +501,7 @@ void report(const Status& st) {
         using UnixName = char*(__cdecl*)(const wchar_t*);
         const auto unix_name = reinterpret_cast<UnixName>(reinterpret_cast<void*>(
             GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "wine_get_unix_file_name")));
-        wchar_t wide[1024];
-        char* mapped = nullptr;
-        if (unix_name && MultiByteToWideChar(CP_ACP, 0, game.c_str(), -1, wide, 1024) > 0) mapped = unix_name(wide);
+        char* mapped = unix_name ? unix_name(nr::u8::wide(game).c_str()) : nullptr;
         if (mapped) {
             game = mapped;
             HeapFree(GetProcessHeap(), 0, mapped);

@@ -8,6 +8,12 @@
 #include <string>
 #include <vector>
 
+// A text the menus show as it comes and translate there (nr_lang.hpp tr_text): make_lang.py takes the literal into
+// the language file.
+#ifndef NR_N
+#define NR_N(text) text
+#endif
+
 namespace nr::control { struct Shared; }
 
 namespace nr::pe::control {
@@ -29,7 +35,10 @@ struct Status {
     int layer = 0;                         // the .asi's NR-chain layer this run was (its row), 0 none
     float fast_passes = 0.f;
     bool motion = false, fast_fallback = false;
+    uint8_t il_missing = 0;                // Passes (fast) Interleaved chosen and not run: why (nr::control::il_missing_note)
+    bool fast_fallback_spatial = false;    // Feedback / Hybrid not run because of peripheral compression
     bool waiting = false;                  // the run passed its frame through, not building (`waiting_why`)
+    bool ran = false;                      // this run's network ran (a switch builds behind the network before)
     std::string waiting_why;
     bool vram_known = false;               // the process's device-local heap: use, budget, size (Session::video_memory)
     uint64_t vram_usage = 0, vram_budget = 0, vram_heap = 0;

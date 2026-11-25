@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Does the RDNA3 build still compute the right picture?  Run before and after any kernel change.
 
-    python3 linux/test/check_rdna3.py --model dlssnr.bin             # check against the golden
-    python3 linux/test/check_rdna3.py --model dlssnr.bin --perf      # also the time per frame
-    python3 linux/test/check_rdna3.py --model dlssnr.bin --profile   # and the time of every kernel at 4K
-    python3 linux/test/check_rdna3.py --model dlssnr.bin --isa       # and instruction mix, VGPRs, spills
+    python3 linux/test/check_rdna3.py --model CC_SILVER_AARDWOLD.bin             # check against the golden
+    python3 linux/test/check_rdna3.py --model CC_SILVER_AARDWOLD.bin --perf      # also the time per frame
+    python3 linux/test/check_rdna3.py --model CC_SILVER_AARDWOLD.bin --profile   # and the time of every kernel at 4K
+    python3 linux/test/check_rdna3.py --model CC_SILVER_AARDWOLD.bin --isa       # and instruction mix, VGPRs, spills
 linux/test/sweep_defines.py times a few pipelines rebuilt with other defines, without the full check.
-    python3 linux/test/check_rdna3.py --model dlssnr.bin --update-golden   # record the current state
+    python3 linux/test/check_rdna3.py --model CC_SILVER_AARDWOLD.bin --update-golden   # record the current state
 
 What it runs, on the first discrete GPU:
   1. the e4m3 quantiser and decoder of linux/shaders/rdna3 against the host's reference over every f16
@@ -28,7 +28,7 @@ How a frame is judged:
 
 The golden is linux/test/golden/rdna3/: output hashes and scores (frames.json) and the per-layer hashes
 of the 1080p network (layers-1080.txt). The golden pixels are the *_dlssnr-amd-rdna3.png files of
-docs/ngx-verification. NVIDIA's weights are not in the repository: --model is a dlssnr.bin made by
+docs/ngx-verification. NVIDIA's weights are not in the repository: --model is a CC_SILVER_AARDWOLD.bin made by
 linux/package/model-tools/extract_model.sh from your own nvngx_dlssnr.dll.
 
 Needs g++, glslang, the Vulkan headers and loader, python3 with numpy and PIL.
@@ -117,7 +117,7 @@ def build(model):
     shutil.rmtree(inst, ignore_errors=True)
     inst.mkdir(parents=True)
     shutil.copytree(ROOT / "build" / "linux" / "rdna3" / "network", inst / "shaders")
-    shutil.copyfile(model, inst / "dlssnr.bin")
+    shutil.copyfile(model, inst / "CC_SILVER_AARDWOLD.bin")
 
 
 # ---- the checks ----------------------------------------------------------------------------------
@@ -197,7 +197,7 @@ def layer_hashes():
     rgba = np.fromfile(BUILD / "in_1080p.rgba8", np.uint8).reshape(-1, 4).astype(np.float32) / 255
     blob = BUILD / "in_1080p.f32"
     rgba.tofile(blob)
-    out = run([str(BUILD / "nr_graph"), "--plan", str(plan), "--model-pack", str(BUILD / "inst/dlssnr-amd/dlssnr.bin"),
+    out = run([str(BUILD / "nr_graph"), "--plan", str(plan), "--model-pack", str(BUILD / "inst/dlssnr-amd/CC_SILVER_AARDWOLD.bin"),
                "--spv-dir", str(ROOT / "build/linux/rdna3/network"), "--host-boundary", "--no-reuse",
                "--source-width", str(w), "--source-height", str(h), "--in-image", str(blob), "--value-stats"])
     rows = []
@@ -217,7 +217,7 @@ def profile(name="4k"):
     plan.write_text(run([str(BUILD / "mkplan"), str(w), str(h)]))
     blob = BUILD / f"in_{name}.f32"
     (np.fromfile(in_path, np.uint8).reshape(-1, 4).astype(np.float32) / 255).tofile(blob)
-    out = run([str(BUILD / "nr_graph"), "--plan", str(plan), "--model-pack", str(BUILD / "inst/dlssnr-amd/dlssnr.bin"),
+    out = run([str(BUILD / "nr_graph"), "--plan", str(plan), "--model-pack", str(BUILD / "inst/dlssnr-amd/CC_SILVER_AARDWOLD.bin"),
                "--spv-dir", str(ROOT / "build/linux/rdna3/network"), "--host-boundary", "--reuse",
                "--source-width", str(w), "--source-height", str(h), "--in-image", str(blob),
                "--warmup", "3", "--repeats", "10", "--per-layer"])
@@ -241,7 +241,7 @@ def isa(name="1080p"):
     plan.write_text(run([str(BUILD / "mkplan"), str(w), str(h)]))
     blob = BUILD / f"in_{name}.f32"
     (np.fromfile(in_path, np.uint8).reshape(-1, 4).astype(np.float32) / 255).tofile(blob)
-    argv = [str(BUILD / "nr_graph"), "--plan", str(plan), "--model-pack", str(BUILD / "inst/dlssnr-amd/dlssnr.bin"),
+    argv = [str(BUILD / "nr_graph"), "--plan", str(plan), "--model-pack", str(BUILD / "inst/dlssnr-amd/CC_SILVER_AARDWOLD.bin"),
             "--spv-dir", str(ROOT / "build/linux/rdna3/network"), "--host-boundary", "--reuse",
             "--source-width", str(w), "--source-height", str(h), "--in-image", str(blob)]
     wiring = run(argv + ["--wiring"])
@@ -294,7 +294,7 @@ def check_layers(golden_rows, record):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--model", required=True, help="dlssnr.bin")
+    ap.add_argument("--model", required=True, help="CC_SILVER_AARDWOLD.bin")
     ap.add_argument("--update-golden", action="store_true")
     ap.add_argument("--perf", type=int, nargs="?", const=20, default=0, help="also time N passes per frame (default 20)")
     ap.add_argument("--tolerance", choices=["exact", "close"], default="exact")

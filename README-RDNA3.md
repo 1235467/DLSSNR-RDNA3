@@ -13,6 +13,13 @@ without warranty.
   have not been run on RDNA3.
 - The package also carries the optional [int4 mixed](#int4-mixed-optional) network: 7 to 8 % less time a
   frame for 3.5 to 5.4 dB less against NVIDIA's output. The installer asks; the default is the network above.
+- It follows upstream 0.0.9: the same NR Control (Add-ons, Hotkeys and language pages), Memory Guard and the
+  lower video memory of 0.0.8.2, History Precision, dynamic resolution, and the Interleaved presets of
+  Passes (fast) (see the main README). The Style grade also runs on RDNA3 now, so Natural and
+  Cinematic match NVIDIA's DLL the way Standard does (26 / 33 dB without it, 49 dB with it on the reference
+  frames); the plain post block is untouched, the grade is an extra pipeline.
+- What is and is not ported from upstream, and what has been verified on hardware:
+  [docs/PORT-STATUS.md](docs/PORT-STATUS.md).
 
 ## What it costs
 
@@ -25,6 +32,11 @@ The network's time per frame on an RX 7900 XTX, one pass, measured from submit t
 | RDNA3, [int4 mixed](#int4-mixed-optional) | | 13.3 ms | 22.8 ms | 50.8 ms |
 | RDNA3, first working version | | 30 ms | 54 ms | 116 ms |
 | RDNA4, RX 9070 XT (main README) | | 5.6 ms | 9.7 ms | 21.9 ms |
+
+The base network's shaders are byte-identical to 0.0.8's apart from the pre block, which reads its noise
+table from a binding of its own since 0.0.9 (the same bytes), so these times still apply; the int4
+network's are unchanged apart from that too. The Style grade adds a second post pipeline and runs only
+for Natural and Cinematic.
 
 That is about 2.6 times the RDNA4 cost. 1280x720 has 44 % of the pixels of 1080p and takes 57 % of
 the time, so the cost does not fall in step with the pixel count. There is no NVIDIA output at 720p to
@@ -144,12 +156,15 @@ both 64-token buffers are live in the same stage and every wave reads both.
 The main project's second network, ported: the heavy matrices of the ViT (the FFN and the QKV), of the C=512
 attention (the QKV) and of the C=256 and C=128 Swin runs (the MLP expansion and the Q, K, V products) run in
 int4, the Swin activations use a hard-swish folded into the next weights, and the rest is the default
-network. Its picture is not the default network's: the tables (`linux/data/int4/rdna4`, 1,112 game frames
-of calibration) are what define it. The installer asks (`--int4`, `--no-int4`; Enter is no), makes the weights
-from your model on your machine, checks them against the pinned SHA-256 and prints the two launch options the
-Vulkan layer needs (`VK_ADD_LAYER_PATH`, `VK_INSTANCE_LAYERS`); Ctrl+F11 in game switches between the two
-networks; `[Int4Mixed]` in `dlssnr-amd.ini`. RDNA3 makes the same weights as RDNA4: the tables are calibrated on
-the FP8 network, whose e4m3 values this build reproduces, and `dlssnr-int4.bin` has the same SHA-256.
+network. Its picture is not the default network's: the tables (`linux/data/int4/rdna3`, 1,112 game frames
+of calibration) are what define it. It is network 3 in the in-game list, `CC_SILVER_AARDWOLD_INT4_MIXED`
+(`--int4`, `--no-int4`; Enter is no): the installer makes the weights from your model on your machine, checks
+them against the pinned SHA-256 and prints the two launch options the Vulkan layer needs (`VK_ADD_LAYER_PATH`,
+`VK_INSTANCE_LAYERS`); Ctrl+F11 in game switches between the networks. RDNA3 has one tier of it
+(`[Network] OptimizedLayers = quality` is the plain network, `balanced` this one; the Performance levels are
+the RDNA4 Optimized layers, which RDNA3 does not have). RDNA3 makes the same weights as the RDNA4 0.0.8 int4
+network: the tables are calibrated on the FP8 network, whose e4m3 values this build reproduces, and
+`dlssnr-int4.bin` has the same SHA-256.
 
 Against the default network (RX 7900 XTX, `linux/test/check_rdna3_int4.py --perf`, wall time of the network):
 
@@ -201,9 +216,9 @@ go together; the runtime refuses it), `VK_KHR_pipeline_binary` and `VK_KHR_maint
 
 nvngx_dlssnr.dll 310.9.16 holds a second, smaller network (`WEIGHTS_CC_SMALL_FP8`: 31 blocks and 76 layers
 against 71 and 152) and uses it by default. Upstream's loader runs it here unchanged: the same layer families at
-the same widths, on the same shaders. The installer makes `dlssnr-small.bin` from the 310.9.16 DLL, installs both
-models and sets `[Network] Model` in `dlssnr-amd.ini` (`small` by default, `original` for the 310.8.0 model); there
-is no int4 mixed for the small model.
+the same widths, on the same shaders. The installer makes `CC_SMALL_FP8.bin` from the 310.9.16 DLL, installs both
+models and sets `[Network] Model` in `dlssnr-amd.ini` (`CC_SMALL_FP8` by default, `CC_SILVER_AARDWOLD` for the
+310.8.0 model); there is no int4 mixed for the small model.
 
 Against NVIDIA's own output of the 310.9.16 DLL (`docs/ngx-verification/310.9.16`), and the network time on an
 RX 7900 XTX (`linux/test/check_rdna3_small.py --perf`, wall time of the network):
@@ -215,7 +230,7 @@ RX 7900 XTX (`linux/test/check_rdna3_small.py --perf`, wall time of the network)
 | small model, RDNA4 (upstream) | | | 49.15 / 49.40 / 50.59 dB |
 
 The 310.8.0 row is scored against NVIDIA's 310.8.0 output, the small model's against its own, so the dB figures
-are not one scale. `check_rdna3_small.py --model dlssnr-small.bin` checks the pictures and every layer against a
+are not one scale. `check_rdna3_small.py --model CC_SMALL_FP8.bin` checks the pictures and every layer against a
 golden.
 
 ## What did not work
@@ -306,7 +321,7 @@ ReShade add-on, the OptiScaler DLLs and the model tools, and writes
   agree (`shader-constants.txt` ties them together) and the runtime refuses a shader folder that does not.
   Without it the build is the RDNA4 one.
 - The package carries no model; `install.sh --dll` extracts it from your own DLL. To build one with a model
-  you extracted yourself, for your own use, set `NR_MODEL=/path/to/dlssnr.bin`. Do not share it.
+  you extracted yourself, for your own use, set `NR_MODEL=/path/to/CC_SILVER_AARDWOLD.bin`. Do not share it.
 - `NR_ARCH=i686` builds the 32-bit package for 32-bit games. It has no OptiScaler route and has not been
   built or run on RDNA3.
 - Only the network shaders: `python3 linux/build/build_network.py rdna3 --out build/linux/rdna3/network`.
@@ -330,11 +345,11 @@ Add-ons) or with `model_scale` in `dlssnr-amd.ini`.
 ## Checking a change
 
 ```
-python3 linux/test/check_rdna3.py --model dlssnr.bin             # build, then check against the golden
-python3 linux/test/check_rdna3.py --model dlssnr.bin --perf      # also the time per frame
-python3 linux/test/check_rdna3.py --model dlssnr.bin --profile   # and the time of every kernel at 4K
-python3 linux/test/check_rdna3.py --model dlssnr.bin --isa       # and instruction mix, VGPRs, spills
-python3 linux/test/check_rdna3_int4.py --model dlssnr.bin         # the same for int4 mixed (--perf, --update-golden)
+python3 linux/test/check_rdna3.py --model CC_SILVER_AARDWOLD.bin             # build, then check against the golden
+python3 linux/test/check_rdna3.py --model CC_SILVER_AARDWOLD.bin --perf      # also the time per frame
+python3 linux/test/check_rdna3.py --model CC_SILVER_AARDWOLD.bin --profile   # and the time of every kernel at 4K
+python3 linux/test/check_rdna3.py --model CC_SILVER_AARDWOLD.bin --isa       # and instruction mix, VGPRs, spills
+python3 linux/test/check_rdna3_int4.py --model CC_SILVER_AARDWOLD.bin         # the same for int4 mixed (--perf, --update-golden)
 ```
 
 It builds the network and host, runs the e4m3 quantiser against the reference over every input, runs the

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Does the RDNA3 int4 mixed network still compute the right picture?  Run before and after any change to it.
 
-    python3 linux/test/check_rdna3_int4.py --model dlssnr.bin             # build, then check against the golden
-    python3 linux/test/check_rdna3_int4.py --model dlssnr.bin --perf      # also the time per frame, int4 and default
-    python3 linux/test/check_rdna3_int4.py --model dlssnr.bin --update-golden
+    python3 linux/test/check_rdna3_int4.py --model CC_SILVER_AARDWOLD.bin             # build, then check against the golden
+    python3 linux/test/check_rdna3_int4.py --model CC_SILVER_AARDWOLD.bin --perf      # also the time per frame, int4 and default
+    python3 linux/test/check_rdna3_int4.py --model CC_SILVER_AARDWOLD.bin --update-golden
 
 What it runs, on the first discrete GPU (the default network's checks are linux/test/check_rdna3.py):
   1. the install-time weights generator on the model: the file it writes has to be the one linux/data/int4/<tables>/
@@ -54,8 +54,8 @@ def build(model):
     data.mkdir(parents=True)
     shutil.copytree(ROOT / "build" / "linux" / "rdna3" / "network", data / "shaders")
     shutil.copytree(INT4 / "data", data / "int4")
-    shutil.copyfile(model, data / "dlssnr.bin")
-    log = run([str(INT4 / "dlssnr-int4-weights"), str(data / "dlssnr.bin"), str(data / "int4"), str(data / "dlssnr-int4.bin")])
+    shutil.copyfile(model, data / "CC_SILVER_AARDWOLD.bin")
+    log = run([str(INT4 / "dlssnr-int4-weights"), str(data / "CC_SILVER_AARDWOLD.bin"), str(data / "int4"), str(data / "dlssnr-int4.bin")])
     return log
 
 
@@ -144,7 +144,7 @@ def layer_hashes():
         if line and not line.startswith("#") and "=" in line:
             k, v = line.split("=", 1)
             env[k] = v
-    out = run([str(BUILD / "nr_graph_int4"), "--plan", str(plan), "--model-pack", str(INST / "dlssnr-amd" / "dlssnr.bin"),
+    out = run([str(BUILD / "nr_graph_int4"), "--plan", str(plan), "--model-pack", str(INST / "dlssnr-amd" / "CC_SILVER_AARDWOLD.bin"),
                "--spv-dir", str(data / "shaders"), "--host-boundary", "--no-reuse",
                "--source-width", str(w), "--source-height", str(h), "--in-image", str(blob), "--value-stats"], env=env)
     rows = []
@@ -172,7 +172,7 @@ def check_layers(golden_rows, record):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--model", required=True, help="dlssnr.bin")
+    ap.add_argument("--model", required=True, help="CC_SILVER_AARDWOLD.bin")
     ap.add_argument("--update-golden", action="store_true")
     ap.add_argument("--perf", type=int, nargs="?", const=20, default=0, help="also time N passes per frame (default 20)")
     ap.add_argument("--skip-build", action="store_true")

@@ -14,7 +14,7 @@
 namespace nr::control {
 
 inline constexpr uint32_t kMagic = 0x4C4F5243u;   // "CROL"
-inline constexpr uint32_t kVersion = 13;
+inline constexpr uint32_t kVersion = 15;   // 15: six networks (CC_SILVER_AARDWOLD_OPTIMIZED's three levels)
 inline constexpr uint32_t kPanelLines = 10;
 inline constexpr uint32_t kMaxLayers = 8;
 // The engine-data line nr_engine_panel.hpp writes when the game gives no exposure and nothing covers it (its start;
@@ -22,6 +22,23 @@ inline constexpr uint32_t kMaxLayers = 8;
 inline constexpr char kNoExposureHint[] = "!The game gives no exposure.";
 // A network field's "none (yet)": one past the networks (nr::NetworkChoice).
 inline constexpr uint32_t kNoNet = nr::kNetworkChoices;
+// Estimated HUD correction has been removed. Keep this false only for legacy configuration/status handling;
+// no estimate shader is built, loaded or dispatched. Auto uses game/captured HUD data only.
+inline constexpr bool kHudEstimated = false;
+#ifndef NR_N
+#define NR_N(text) text   // a text for the menus' language file (nr_lang.hpp)
+#endif
+// A layer's note when Feedback / Hybrid cannot run (one network pass): no motion vectors, or peripheral compression
+inline const char* fast_fallback_note(bool spatial) {
+    return spatial ? NR_N("Feedback / Hybrid cannot run: peripheral compression is on")
+                   : NR_N("Feedback / Hybrid cannot run: no motion vectors");
+}
+// A layer's note when Passes (fast) Interleaved is chosen and cannot run (it then runs one network pass, no other method).
+inline const char* il_missing_note(uint32_t why) {
+    return why == 2u ? NR_N("Interleaved cannot run: peripheral compression is on")
+         : why == 3u ? NR_N("Interleaved cannot run: its shaders are missing")
+                     : NR_N("Interleaved cannot run: no motion vectors");
+}
 
 // One layer of the .asi's NR chain as it last ran, for NR Control's status (rows by layer number; 0: an empty row).
 struct LayerStatus {
@@ -37,7 +54,7 @@ struct LayerStatus {
     uint32_t motion;                // this layer had motion vectors on its last run
     float gpu_ms, network_ms;       // its runtime's average a run: all of it, and the network's part
     uint32_t updated;               // GetTickCount (low 32 bits) of the last update
-    char note[64];                  // why it was skipped, or what it waits for
+    char note[192];                 // why it was skipped, or what it waits for (the longest notes run past 90 characters)
     uint32_t panel_lines;           // the engine-data panel of this layer's runs (as Shared::panel)
     char panel[kPanelLines][192];
     uint32_t panel_at;              // GetTickCount (low 32 bits) of its last write
@@ -105,9 +122,13 @@ struct Shared {
     char asi_build[48];
     char frame_gen[160];
     // DLL -> menu (the .asi route): HUD FIX ([HudFix]) - what it does now, and why each method cannot run here (by
-    // Mode: 0 frame generation's HUD-less frame, 1 captured before the HUD, 2 estimated; "" it can)
-    char hud_now[128];
-    char hud_why[3][160];
+    // Mode: 0 frame generation's HUD-less frame, 1 captured before the HUD, 2 unused - the removed estimate; "" it can)
+    char hud_now[256];
+    char hud_why[3][256];
+    // DLL watcher -> menu: the keys pressed (up -> down) since the menu last took them, by virtual-key code. The menu
+    // looks at `keys` once a drawn frame: at a few frames a second (a game over its video memory: 1 fps in a main menu)
+    // a press and release between two frames was never seen and End did not open the menu. Set and taken atomically.
+    uint32_t pressed[8];
 };
 static_assert(sizeof(Shared) % 4 == 0, "a plain array of words");
 

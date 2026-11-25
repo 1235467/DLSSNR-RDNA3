@@ -6,9 +6,9 @@
 # shader-constants.txt disagrees with the defines below. The shaders are built by
 # `python3 linux/build/build_network.py rdna3` from linux/shaders/rdna3/pipelines.json.
 NR_GPU_ARCH=rdna3
-# linux/data/int4/<this>/: the int4 mixed option's tables. They are calibrated on the FP8 network and this build reproduces
-# its e4m3 values, so the RDNA4 tables apply as they are: the weights made from them have the same SHA-256.
-NR_INT4_DATA=rdna4
+# linux/data/int4/<this>/: the int4 mixed network's tables. They are calibrated on the FP8 network and this build
+# reproduces its e4m3 values, so they are the tables RDNA4's 0.0.8 int4 network used, kept here as they were.
+NR_INT4_DATA=rdna3
 NR_PRODUCT_SPV=build/linux/rdna3/network
 NR_PRODUCT_DEFINES=(
     -DNR_ARCH_RDNA3=1
@@ -22,5 +22,6 @@ NR_PRODUCT_DEFINES=(
     -DNR_PERSIST_ONE_MASK=6 -DNR_NOISE_FIELD=1 -DNR_FFWD_FM2_MIN_TOKENS=2560 -DNR_POST_ALPHA=1
     -DNR_TCHAIN_TILES=1
 )
-# The model pack's file name inside dlssnr-amd/ (linux/src/core/nr_runtime.cpp).
-NR_MODEL_NAME=dlssnr.bin
+# The model pack's file name inside dlssnr-amd/ (linux/src/core/nr_runtime.cpp). The same pack as RDNA4's: the
+# network reproduces the FP8 one's e4m3 values.
+NR_MODEL_NAME=CC_SILVER_AARDWOLD.bin

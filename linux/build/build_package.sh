@@ -6,24 +6,30 @@
 #   optiscaler/          OptiScaler (the official nightly, unmodified) and our NR plugin for it (x86_64 only)
 #   model-tools/         rebuilds the model from nvngx_dlssnr.dll at install time
 #   experimental/        makes CC_SMALL_FP8_EXPERIMENTAL's weights from the small model at install time
+#   optimized/           makes CC_SILVER_AARDWOLD_OPTIMIZED's weights from the 310.8 model at install time
 #   install.sh, README.txt
 #
 #   NR_ARCH=x86_64|i686 bash linux/build/build_package.sh [build dir]
-#   NR_MODEL=dlssnr.bin put this model in the package (made from your own DLL by
+#   NR_MODEL=CC_SILVER_AARDWOLD.bin put this model in the package (made from your own DLL by
 #                       linux/package/model-tools/extract_model.sh); without it
 #                       install.sh needs --dll
-#   NR_MODEL_SMALL=dlssnr-small.bin  with NR_MODEL: the new model too (from the 310.9.16 DLL)
+#   NR_MODEL_SMALL=CC_SMALL_FP8.bin  with NR_MODEL: the new model too (from the 310.9.16 DLL)
 #   NR_GPU=rdna3|rdna4  the network to build (linux/build/arch/); default rdna4. An rdna3 package
-#                       carries -rdna3 in its name
+#                       carries -rdna3 in its name and only the networks RDNA3 has (no Optimized layers,
+#                       no CC_SMALL_FP8_EXPERIMENTAL; int4 mixed instead of the int4 layers)
 #   NR_VERSION=...      override the version (default: from the git tags, linux/build/version.sh)
+#   NR_LANG_EXTRA=<dir> test packages only: extra language files (and fonts/) into dlssnr-amd/lang
+#   NR_SIGN=1           the package's Windows binaries signed (self-signed, linux/build/sign_pe.py)
 #
-# Packages also carry int4/, the int4 mixed option install.sh adds when asked for: the ReShade add-on built again
-# with NR_INT4=1 (this script with NR_INT4=1 NR_PROGRAMS_ONLY=1), the int4 network, its data, the Vulkan layer and the
-# install-time weights generator (build_int4.sh), and its dlssnr-amd.ini.
+# Packages also carry int4/, CC_SILVER_AARDWOLD_OPTIMIZED's int4 layers, which install.sh adds: the ReShade add-on
+# built again with NR_INT4=1 (this script with NR_INT4=1 NR_PROGRAMS_ONLY=1), the network with them, their data, the
+# Vulkan layer and the install-time weights generator (build_int4.sh).
 set -euo pipefail
 model=${NR_MODEL:+$(realpath -- "$NR_MODEL")}
 small=${NR_MODEL_SMALL:+$(realpath -- "$NR_MODEL_SMALL")}
 cd -- "$(dirname -- "$0")/../.."
+bash linux/build/check_paths.sh   # UTF-8 paths only in the Windows code (a game folder with any letters)
+bash linux/build/check_imgui.sh   # ReShade's ImGui is MSVC's: no ImVec2-returning call from the add-on's code
 arch=${NR_ARCH:-x86_64}
 case "$arch" in x86_64|i686) ;; *) echo "NR_ARCH must be x86_64 or i686" >&2; exit 2;; esac
 if [[ "$arch" == i686 ]]; then default_out=artifacts/package-build/nr32; bits=32; else default_out=artifacts/package-build/nr; bits=64; fi
@@ -45,7 +51,9 @@ source "linux/build/arch/$gpu.sh"
 
 # ---- compile ----------------------------------------------------------------
 common=(-std=c++17 -O2 -DNDEBUG -Itoolchain/Vulkan-Headers/include -Ilinux/src -Ilinux/src/core -Ilinux/src/layer -Ilinux/src/pe -I"$out")
-[[ "${NR_INT4:-0}" == 1 ]] && common+=(-DNR_INT4=1)   # the int4 mixed build of the programs (int4/ below)
+# (NR_RESHADE_ROUTE: these are the ReShade add-on's objects, all of them - the route's defaults, nr_fast_passes.hpp)
+common+=(-DNR_RESHADE_ROUTE=1)
+[[ "${NR_INT4:-0}" == 1 ]] && common+=(-DNR_INT4=1)   # the build of the programs with the int4 layers (int4/ below)
 "$cxx" "${common[@]}" "${NR_PRODUCT_DEFINES[@]}" -c linux/src/core/nr_runtime.cpp -o "$out/nr_runtime.o"
 "$cxx" "${common[@]}" -c linux/src/core/nr_native_plan.cpp -o "$out/nr_native_plan.o"
 "$cxx" "${common[@]}" -c linux/src/core/nr_renodx.cpp -o "$out/nr_renodx.o"
@@ -216,6 +224,13 @@ lazy=("$out/vulkan_lazy_s.o" "$out/vulkan_lazy_c.o")
 pkg="$out/package"
 rm -rf -- "$pkg"; mkdir -p -- "$pkg"
 bash linux/build/assemble_product_data.sh "$pkg" ${model:+--model "$model"} ${model:+${small:+--small-model "$small"}}
+# NR_LANG_EXTRA=<dir> (test packages only): its language files (*.txt) into dlssnr-amd/lang and its fonts with their
+# licences (fonts/) into dlssnr-amd/lang/fonts, for a language file's @font = fonts/<file> (as the Windows package)
+if [[ -n "${NR_LANG_EXTRA:-}" ]]; then
+    [[ -d "$NR_LANG_EXTRA" ]] || { echo "NR_LANG_EXTRA: no such folder: $NR_LANG_EXTRA" >&2; exit 1; }
+    cp -- "$NR_LANG_EXTRA"/*.txt "$pkg/dlssnr-amd/lang/"
+    [[ -d "$NR_LANG_EXTRA/fonts" ]] && cp -r -- "$NR_LANG_EXTRA/fonts" "$pkg/dlssnr-amd/lang/"
+fi
 
 # model-tools/: what install.sh --dll runs to rebuild the model from the DLL.
 mt="$pkg/model-tools"
@@ -300,14 +315,14 @@ sed 's/^PreprocessorDefinitions=.*/&,RESHADE_DEPTH_INPUT_IS_REVERSED=0/' "$rs/Re
 # and our NR as an OptiScaler plugin (optiscaler/asi): dlssnr-amd.asi, installed into OptiScaler\plugins, which runs NR
 # on the game's own upscaler call and draws NR Control, and NR Control's swap-chain probe (into dlssnr-amd\; the
 # wilsjo2 processing's shaders are in dlssnr-amd\shaders\wilsjo2 for every route, assemble_product_data.sh). The plugin
-# is built with the int4 mixed network (it adds that network's device extensions itself: no Vulkan layer on this route).
+# is built with the int4 layers (it adds the device extensions they need itself: no Vulkan layer on this route).
 if [[ "$arch" == x86_64 ]]; then
-    opti_7z=${NR_OPTI_ARCHIVE:-artifacts/ref/downloads/OptiScaler_v10.0.0-pre1_20261028.7z}
-    opti_license=${NR_OPTI_LICENSE:-artifacts/ref/optiscaler-nightly-20261028/LICENSE}
+    opti_7z=${NR_OPTI_ARCHIVE:-artifacts/ref/downloads/OptiScaler_v10.0.0-pre1_20261030.7z}
+    opti_license=${NR_OPTI_LICENSE:-artifacts/ref/optiscaler-nightly-20261030/LICENSE}
     [[ -f "$opti_7z" && -f "$opti_license" ]] || { echo "missing $opti_7z or $opti_license" >&2; exit 1; }
     if [[ -z "${NR_OPTI_ARCHIVE:-}" ]]; then   # the archive the package was tested with
-        [[ "$(sha256sum -- "$opti_7z" | cut -d' ' -f1)" == e3a4f533d19a5818a821093f7dcbd9698b96b9b60dcb0e577c569a0b33c94a33 ]] ||
-            { echo "$opti_7z is not the tested OptiScaler nightly-20261028" >&2; exit 1; }
+        [[ "$(sha256sum -- "$opti_7z" | cut -d' ' -f1)" == db4fe2deae7edd9f6657f5cb223edc694ebdec62b52f15a3a59913f8b656c176 ]] ||
+            { echo "$opti_7z is not the tested OptiScaler nightly-20261030" >&2; exit 1; }
     fi
     command -v 7z >/dev/null || { echo "7z is needed to unpack $opti_7z" >&2; exit 1; }
     rm -rf -- "$pkg/optiscaler"
@@ -316,7 +331,8 @@ if [[ "$arch" == x86_64 ]]; then
     [[ -f "$pkg/optiscaler/release/OptiScaler.dll" && -f "$pkg/optiscaler/release/OptiScaler.ini" &&
        -d "$pkg/optiscaler/release/OptiScaler" ]] || { echo "$opti_7z is not laid out as OptiScaler v10" >&2; exit 1; }
     cp -- "$opti_license" "$pkg/optiscaler/OptiScaler_LICENSE.txt"
-    bash linux/build/build_asi.sh artifacts/optiscaler/asi > /dev/null
+    # stamped with the package's version (its log line and NR Control's title), not the bare commit
+    NR_STAMP=$(bash linux/build/version.sh) bash linux/build/build_asi.sh artifacts/optiscaler/asi > /dev/null
     cp -- artifacts/optiscaler/asi/dlssnr-amd.asi artifacts/optiscaler/asi/nr_present_probe.exe "$pkg/optiscaler/asi/"
     # the notices of what dlssnr-amd.asi has compiled in: NR Control's font (Inter, SIL OFL 1.1) and Dear ImGui (MIT)
     cp -- "${NR_MENU_FONT_LICENSE:-toolchain/fonts/inter-4.1/LICENSE.txt}" "$pkg/optiscaler/asi/Inter-LICENSE.txt"
@@ -332,9 +348,11 @@ fi
 # dlssnr-amd.ini, put in place at install (the text the programs write themselves, linux/package/make_ini.py)
 python3 linux/package/make_ini.py linux/src/pe/nr_pe_config.cpp "$pkg/ini" > /dev/null
 
-# int4/: the int4 mixed option. The int4 build of the programs that differ, dlssnr-amd/int4 (network,
-# quantisers, recovery tables, settings, layer), the weights generator and the SHA-256 of what it must make from the
-# model (linux/data/int4/<NR_INT4_DATA>/dlssnr-int4.sha256, checked by install.sh).
+# int4/: the int4 option. The int4 build of the programs that differ, dlssnr-amd/int4 (network,
+# quantisers, recovery tables, settings, layer), the weights generator and the SHA-256 of what it must make
+# (linux/data/int4/<arch>/dlssnr-int4.sha256, checked by install.sh). RDNA4: CC_SILVER_AARDWOLD_OPTIMIZED's int4
+# layers, three tiers (int4-performance/, int4-ultra/) made from CC_SILVER_AARDWOLD_OPTIMIZED's weights. RDNA3: the
+# int4 mixed network, one tier, made from CC_SILVER_AARDWOLD's weights (dlssnr-int4.bin).
 # i686: no OptiScaler route, so only the add-on; the layer comes in both widths (build_int4.sh NR_LAYER32).
 if [[ "$arch" == x86_64 || "$arch" == i686 ]]; then
     i4="$pkg/int4"
@@ -344,8 +362,17 @@ if [[ "$arch" == x86_64 || "$arch" == i686 ]]; then
     mkdir -p -- "$i4/reshade" "$i4/dlssnr-amd"
     cp -- "$out/int4/dlssnr_amd.addon$bits" "$i4/reshade/"
     cp -r -- "$out/int4/parts/data" "$i4/dlssnr-amd/int4"
+    cp -r -- "$out/int4/parts/data-performance" "$i4/dlssnr-amd/int4-performance"
+    cp -r -- "$out/int4/parts/data-ultra" "$i4/dlssnr-amd/int4-ultra"
     cp -- "$out/int4/parts/dlssnr-int4-weights" "$i4/"
-    cp -- "linux/data/int4/$NR_INT4_DATA/dlssnr-int4.sha256" "$i4/dlssnr-int4.bin.sha256"
+    cp -r -- "$out/int4/parts/data" "$i4/dlssnr-amd/int4"
+    if [[ -d "$out/int4/parts/data-performance" ]]; then
+        cp -r -- "$out/int4/parts/data-performance" "$i4/dlssnr-amd/int4-performance"
+        cp -r -- "$out/int4/parts/data-ultra" "$i4/dlssnr-amd/int4-ultra"
+        cp -- "linux/data/int4/$NR_GPU_ARCH/dlssnr-int4.sha256" "$i4/CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin.sha256"
+    else
+        cp -- "linux/data/int4/${NR_INT4_DATA:-$NR_GPU_ARCH}/dlssnr-int4.sha256" "$i4/dlssnr-int4.bin.sha256"
+    fi
 fi
 # experimental/: what install.sh makes CC_SMALL_FP8_EXPERIMENTAL's weights with - the difference of its fitted weights
 # from the small model's (linux/data/experimental: each changed entry XOR the small model's, so it holds none of
@@ -355,10 +382,21 @@ if [[ -f "linux/shaders/$NR_GPU_ARCH/pipelines-experimental.json" ]]; then
     mkdir -p -- "$pkg/experimental"
     cp -- linux/data/experimental/dlssnr-small-experimental.delta "$pkg/experimental/"
     cp -- linux/build/experimental_weights.py "$pkg/experimental/"
-    cp -- linux/data/experimental/dlssnr-small-experimental.sha256 "$pkg/experimental/dlssnr-small-experimental.bin.sha256"
+    cp -- linux/data/experimental/dlssnr-small-experimental.sha256 "$pkg/experimental/CC_SMALL_FP8_EXPERIMENTAL.bin.sha256"
+fi
+# optimized/: the same for CC_SILVER_AARDWOLD_OPTIMIZED, from the 310.8 model's weights (linux/data/optimized). Its shaders
+# are in dlssnr-amd/optimized/; its int4 layers' weights are made from the result (int4/ above). RDNA4 only.
+if [[ -f "linux/shaders/$NR_GPU_ARCH/pipelines-optimized.json" ]]; then
+    mkdir -p -- "$pkg/optimized"
+    cp -- linux/data/optimized/dlssnr-optimized.delta linux/build/experimental_weights.py "$pkg/optimized/"
+    cp -- linux/data/optimized/dlssnr-optimized.sha256 "$pkg/optimized/CC_SILVER_AARDWOLD_OPTIMIZED.bin.sha256"
 fi
 cp -- linux/package/install.sh linux/package/README.txt linux/package/lumenite.py "$pkg/"
 chmod +x "$pkg/install.sh" "$mt/extract_model.sh"
+
+# NR_SIGN=1: every Windows binary without a signature of its own signed with a self-signed certificate made for this
+# build (linux/build/sign_pe.py; some games load only signed DLLs and do not ask by whom)
+[[ "${NR_SIGN:-0}" == 1 ]] && python3 linux/build/sign_pe.py "$pkg"
 
 # ---- archive ------------------------------------------------------------------
 version=$(bash linux/build/version.sh)

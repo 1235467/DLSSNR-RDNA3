@@ -1,0 +1,126 @@
+# Builds the packages and makes a GitLab release of them when a v* tag is pushed; nothing runs on ordinary pushes
+# or merge requests. "Run pipeline" in GitLab's web page (Build > Pipelines) builds the packages without a release,
+# as a test (they are then versioned 0.0.0-g<commit>). The version in the package names is the tag's (v0.0.8.2 ->
+# 0.0.8.2). No package contains a model: the installers extract it from the user's own nvngx_dlssnr.dll.
+#
+# Every Windows binary of the packages without a signature of its own is signed with a self-signed certificate made
+# for the run (NR_SIGN=1, */build/sign_pe.py; some games load only signed DLLs).
+#
+# Windows switch: the Windows package is built unless the CI/CD variable WINDOWS_PACKAGE is "off"
+# (for a Linux-only release):
+#   glab variable set WINDOWS_PACKAGE off     # Linux only
+#   glab variable set WINDOWS_PACKAGE on      # Linux and Windows
+# A tag with "-win-" in it (v0.0.4-win-preview) is a Windows-only release: no Linux packages. A tag
+# with "-linux-" in it is a Linux-only release.
+#
+# The release job puts the packages into the project's generic package registry
+# (packages/generic/dlssnr-amd/<version>/) and links them from the release; the release text is written in
+# GitLab's release page afterwards.
+
+stages: [build, release]
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v/
+    - if: $CI_PIPELINE_SOURCE == "web"
+
+variables:
+  GIT_DEPTH: 1              # the version comes from the tag (NR_VERSION below), not from the history
+  DEBIAN_FRONTEND: noninteractive
+
+default:
+  image: ubuntu:24.04
+  timeout: 3h
+
+.version: &version
+  - if [[ -n "${CI_COMMIT_TAG:-}" ]]; then export NR_VERSION=${CI_COMMIT_TAG#v}; fi
+
+linux:
+  stage: build
+  rules:
+    - if: $CI_COMMIT_TAG =~ /-win-/
+      when: never
+    - when: on_success
+  script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends ca-certificates git curl cmake ninja-build mingw-w64 g++-multilib
+      python3 p7zip-full openssl osslsigncode
+    - *version
+    - bash fetch_deps.sh
+    - bash linux/build/build_vulkan_loader.sh
+    - NR_ARCH=x86_64 NR_SIGN=1 bash linux/build/build_package.sh
+    - NR_ARCH=i686 NR_SIGN=1 bash linux/build/build_package.sh
+    # no model was packaged
+    - |
+      for f in linux/package/*.tar.gz; do
+        if tar -tzf "$f" | grep -q 'dlssnr\(-small\)\?\.bin$'; then echo "model found in $f" >&2; exit 1; fi
+      done
+  artifacts:
+    name: linux-packages
+    paths:
+      - linux/package/*.tar.gz
+    expire_in: 7 days       # a release keeps its own copy in the package registry
+
+windows:
+  stage: build
+  rules:
+    - if: $WINDOWS_PACKAGE == "off"
+      when: never
+    - if: $CI_COMMIT_TAG =~ /-linux-/
+      when: never
+    - when: on_success
+  script:
+    - apt-get update
+    # g++: windows/package/model-tools/build_extract_model.sh builds the native model extractor
+    - apt-get install -y --no-install-recommends ca-certificates git curl cmake ninja-build mingw-w64 g++ python3
+      p7zip-full openssl osslsigncode
+    - *version
+    - bash fetch_deps.sh --windows
+    - NR_SIGN=1 bash windows/build/build_package.sh   # builds the Vulkan loader and the OptiScaler plugin too
+    # no model was packaged
+    - |
+      python3 - windows/package/*.zip <<'PY'
+      import sys, zipfile
+      for f in sys.argv[1:]:
+          if any(n.endswith(('CC_SILVER_AARDWOLD.bin', 'CC_SMALL_FP8.bin', 'dlssnr.bin', 'dlssnr-small.bin')) for n in zipfile.ZipFile(f).namelist()):
+              sys.exit(f'model found in {f}')
+      PY
+  artifacts:
+    name: windows-package
+    paths:
+      - windows/package/*.zip
+    expire_in: 7 days
+
+release:
+  stage: release
+  image: buildpack-deps:noble-curl   # bash + curl, nothing to install
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v/
+  variables:
+    GIT_STRATEGY: none      # needs only the packages (artifacts) and the CI variables
+  needs:
+    - job: linux
+      optional: true
+    - job: windows
+      optional: true
+  script:
+    - |
+      set -euo pipefail
+      version=${CI_COMMIT_TAG#v}
+      registry="$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/dlssnr-amd/$version"
+      links=""
+      for f in linux/package/*.tar.gz windows/package/*.zip; do
+        [[ -f "$f" ]] || continue
+        name=$(basename -- "$f")
+        [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "unexpected package name: $name" >&2; exit 1; }
+        curl -fsS --retry 3 -H "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$f" "$registry/$name" > /dev/null
+        echo "uploaded $name"
+        links+="${links:+,}{\"name\":\"$name\",\"url\":\"$registry/$name\",\"direct_asset_path\":\"/$name\",\"link_type\":\"package\"}"
+      done
+      [[ -n "$links" ]] || { echo "no packages" >&2; exit 1; }
+      [[ "$CI_COMMIT_TAG" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "unexpected tag: $CI_COMMIT_TAG" >&2; exit 1; }
+      printf '{"tag_name":"%s","name":"%s","description":"%s","assets":{"links":[%s]}}' \
+        "$CI_COMMIT_TAG" "$CI_COMMIT_TAG" "$CI_COMMIT_TAG" "$links" > release.json
+      curl -fsS --retry 3 -H "JOB-TOKEN: $CI_JOB_TOKEN" -H "Content-Type: application/json" \
+        --data @release.json "$CI_API_V4_URL/projects/$CI_PROJECT_ID/releases" > /dev/null
+      echo "release $CI_COMMIT_TAG created"

@@ -1,12 +1,16 @@
+#include "nr_path_win.hpp"
 #include "nr_pe_d3d12split.hpp"
 
 #include "nr_pe_log.hpp"
 
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <functional>
+#include <map>
 #include <mutex>
 #include <unordered_map>
 #include <utility>
@@ -19,6 +23,7 @@ bool prepare(ID3D12GraphicsCommandList*, std::string* why) {
     *why = "the command-list cut is x86-64 only";
     return false;
 }
+bool disabled() { return true; }
 struct Snapshot {};
 std::shared_ptr<Snapshot> snapshot(ID3D12GraphicsCommandList*) { return nullptr; }
 void restore(ID3D12GraphicsCommandList*, const std::shared_ptr<Snapshot>&) {}
@@ -549,13 +554,28 @@ bool patch_list_class(List* list, std::string* why);
 
 void forget_list(void* self);
 
+// One Recording per list: the bridge Job's own structure (sealed, waits, submitted). A list gets a new one after a
+// successful Reset or its release; the old one stays with whoever still holds it.
+std::unordered_map<ID3D12CommandList*, std::shared_ptr<nr::gpu::Recording>> g_recordings;   // g_mutex
+// Set by the first book(): until then (the D3D12 passthrough off) a plain submission takes no lock of ours.
+std::atomic<bool> g_booked{false};
+
 ULONG STDMETHODCALLTYPE hk_Release(List* self) {
     const ULONG left = orig_fn<ULONG(STDMETHODCALLTYPE*)(List*)>(self, kRelease)(self);
     // Gone: a new list may be created at this address, and must neither inherit this one's state nor
     // be redirected into this one's continuation.
-    if (left == 0) forget_list(self);
+    if (left == 0) {
+        forget_list(self);
+        if (!g_booked.load(std::memory_order_acquire)) return left;
+        std::lock_guard<std::recursive_mutex> guard(g_mutex);
+        auto it = g_recordings.find(reinterpret_cast<ID3D12CommandList*>(self));
+        if (it != g_recordings.end() && it->second) it->second->seal();
+    }
     return left;
 }
+
+// Booking tickets: one per recording (list), stamped at each execution on that queue's fence, ended by Reset.
+
 
 HRESULT STDMETHODCALLTYPE hk_Reset(List* self, ID3D12CommandAllocator* allocator, ID3D12PipelineState* pso) {
     if (g_pending.load(std::memory_order_acquire) || g_held_count.load(std::memory_order_acquire)) {
@@ -579,6 +599,13 @@ HRESULT STDMETHODCALLTYPE hk_Reset(List* self, ID3D12CommandAllocator* allocator
     }
     const HRESULT hr = orig_fn<HRESULT(STDMETHODCALLTYPE*)(List*, ID3D12CommandAllocator*, ID3D12PipelineState*)>(
         self, kReset)(self, allocator, pso);
+    if (SUCCEEDED(hr) && g_booked.load(std::memory_order_acquire)) {
+        // Only a successful Reset ends the recording, through the same seal() the tickets use everywhere; the next
+        // book() on this list opens a new generation. A failed Reset leaves the recording as it was.
+        std::lock_guard<std::recursive_mutex> guard(g_mutex);
+        auto it = g_recordings.find(reinterpret_cast<ID3D12CommandList*>(self));
+        if (it != g_recordings.end() && it->second) it->second->seal();
+    }
     if (SUCCEEDED(hr)) state_of(self)->reset(pso);
     return hr;
 }
@@ -988,6 +1015,23 @@ PFN_Execute execute_of(ID3D12CommandQueue* q) {
     return n ? reinterpret_cast<PFN_Execute>(g_queue_classes[n - 1].execute) : nullptr;
 }
 
+QueueFence* completion_fence(ID3D12CommandQueue* q);
+
+
+
+uint64_t queue_value(ID3D12CommandQueue* queue) {
+    std::lock_guard<std::recursive_mutex> guard(g_mutex);
+    QueueFence* f = completion_fence(queue);
+    return f ? f->value : 0;
+}
+uint64_t queue_completed(ID3D12CommandQueue* queue) {
+    std::lock_guard<std::recursive_mutex> guard(g_mutex);
+    QueueFence* f = completion_fence(queue);
+    if (!f || !f->fence) return 0;
+    const uint64_t v = f->fence->GetCompletedValue();
+    return v == UINT64_MAX ? 0 : v;
+}
+
 QueueFence* completion_fence(ID3D12CommandQueue* q) {
     for (auto& f : g_queue_fences) if (f.queue == q) return &f;
     ID3D12Device* device = nullptr;
@@ -1005,16 +1049,63 @@ QueueFence* completion_fence(ID3D12CommandQueue* q) {
 thread_local ID3D12CommandQueue* t_last_direct = nullptr;
 thread_local ID3D12CommandQueue* t_last_seen = nullptr;
 
+void execute_cut(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists, PFN_Execute execute);
+
+// The signal a booking needs: the same per-queue fence the continuations wait on. Called after the execution of
+// these lists, under g_mutex, so each booked list carries one receipt per execution.
+void stamp_bookings_locked(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists) {
+    // Nothing to stamp for a submission that carries no live recording: no fence is created or signalled for it.
+    bool any = false;
+    for (UINT i = 0; i < n && !any; ++i) {
+        auto it = g_recordings.find(lists[i]);
+        if (it != g_recordings.end() && it->second && !it->second->sealed) any = true;
+    }
+    if (!any) return;
+    QueueFence* f = completion_fence(q);
+    const bool signalled = f && f->fence && SUCCEEDED(q->Signal(f->fence, f->value + 1));
+    if (signalled) ++f->value;
+    for (UINT i = 0; i < n; ++i) {
+        auto it = g_recordings.find(lists[i]);
+        if (it == g_recordings.end() || !it->second || it->second->sealed) continue;
+        // A failed signal is an unknown submission: strict_ready() then never treats it as finished.
+        if (!signalled) { it->second->submitted(nullptr); continue; }
+        ID3D12Fence* fence = f->fence;
+        fence->AddRef();
+        const uint64_t value = f->value;
+        it->second->submitted([fence, value] {
+            const uint64_t v = fence->GetCompletedValue();
+            const bool done = v != UINT64_MAX && v >= value;
+            if (done) fence->Release();   // the wait owns one reference while it is pending
+            return done;
+        });
+    }
+}
+
 void STDMETHODCALLTYPE hk_Execute(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists) {
     // Patching is under g_mutex; the class table only grows, so a lookup outside it is safe once the
     // hook it led here through exists.
     const PFN_Execute execute = execute_of(q);
+    // After the first evaluates, every execution step by step (trace_arm)
+    const int tr = trace_execute();
+    if (tr) log("[nr] trace x%d: ExecuteCommandLists in (queue %p, %u lists, thread %lu)", tr, static_cast<void*>(q), n,
+                GetCurrentThreadId());
+    execute_cut(q, n, lists, execute);
+    if (tr) log("[nr] trace x%d: ExecuteCommandLists out", tr);
+}
+
+void execute_cut(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists, PFN_Execute execute) {
     if (q != t_last_seen) {   // last_direct_queue(): asked once per change of queue on this thread
         t_last_seen = q;
         if (q->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) t_last_direct = q;
     }
-    if (g_pending.load(std::memory_order_acquire) == 0 && g_held_count.load(std::memory_order_acquire) == 0)
-        return execute(q, n, lists);
+    if (g_pending.load(std::memory_order_acquire) == 0 && g_held_count.load(std::memory_order_acquire) == 0) {
+        execute(q, n, lists);
+        if (g_booked.load(std::memory_order_acquire)) {
+            std::lock_guard<std::recursive_mutex> guard(g_mutex);
+            stamp_bookings_locked(q, n, lists);
+        }
+        return;
+    }
     // The cuts of these lists are taken out under the lock; the lists are executed outside it, so no
     // lock of ours is held across the runtime's (or an overlay's) ExecuteCommandLists or the driver.
     struct Expand { UINT index; Cut cut; std::vector<Cont*> again; };
@@ -1035,6 +1126,14 @@ void STDMETHODCALLTYPE hk_Execute(ID3D12CommandQueue* q, UINT n, ID3D12CommandLi
         }
     }
     if (work.empty()) return execute(q, n, lists);
+    // The first executions of cut lists, step by step (PBZ: the game ended right after the first frame with a layer
+    // before the upscaler, with nothing logged)
+    static std::atomic<int> traced{0};
+    const int tr = traced.load() < 12 ? ++traced : 0;
+    size_t segments = 0;
+    for (const auto& w : work) segments += w.cut.segments.size();
+    if (tr) log("[nr] trace: lists with %zu cut(s) executed on queue %p (%u lists), thread %lu", segments,
+                static_cast<void*>(q), n, GetCurrentThreadId());
     static bool said_again = false;
     std::vector<ID3D12CommandList*> batch;
     std::vector<Cont*> ran;
@@ -1057,10 +1156,26 @@ void STDMETHODCALLTYPE hk_Execute(ID3D12CommandQueue* q, UINT n, ID3D12CommandLi
         for (Cont* c : w.again) { batch.push_back(c->list); ran.push_back(c); }
     }
     if (!batch.empty()) execute(q, UINT(batch.size()), batch.data());
+    if (tr) log("[nr] trace: those lists and the network's hand-overs executed");
     std::lock_guard<std::recursive_mutex> guard(g_mutex);
     QueueFence* f = completion_fence(q);
     const bool signalled = f && SUCCEEDED(q->Signal(f->fence, f->value + 1));
     if (signalled) ++f->value;
+    if (signalled && !g_recordings.empty()) {
+        for (UINT i = 0; i < n; ++i) {
+            auto it = g_recordings.find(lists[i]);
+            if (it == g_recordings.end() || !it->second || it->second->sealed) continue;
+            ID3D12Fence* fence = f->fence;
+            fence->AddRef();
+            const uint64_t value = f->value;
+            it->second->submitted([fence, value] {
+                const uint64_t v = fence->GetCompletedValue();
+                const bool done = v != UINT64_MAX && v >= value;
+                if (done) fence->Release();
+                return done;
+            });
+        }
+    }
     for (Cont* c : ran) {
         // Without a completion mark a continuation is never handed out again.
         c->fence = signalled ? f->fence : nullptr;
@@ -1090,9 +1205,9 @@ bool write_vtable(void** vt, unsigned slot, void* fn) {
 // Where an address lives, for the log: a module's file name, or private memory (a heap).
 std::string where_is(const void* p) {
     HMODULE m = nullptr;
-    char path[MAX_PATH] = {};
+    char path[MAX_PATH * 4] = {};
     if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           static_cast<const char*>(p), &m) && m && GetModuleFileNameA(m, path, sizeof path)) {
+                           static_cast<const char*>(p), &m) && m && nr::u8::module_file(m, path, sizeof path)) {
         const char* base = std::strrchr(path, '\\');
         return base ? base + 1 : path;
     }
@@ -1470,8 +1585,52 @@ bool cut(List* list, Job job, const std::shared_ptr<Snapshot>& state, std::strin
     return true;
 }
 
+bool disabled() {
+    std::lock_guard<std::recursive_mutex> guard(g_mutex);
+    return g_disabled;
+}
+
 #endif
 
 ID3D12CommandQueue* last_direct_queue() { return t_last_direct; }
+
+std::shared_ptr<nr::gpu::Recording> book(ID3D12CommandList* list) {
+    if (!list) return nullptr;
+    std::lock_guard<std::recursive_mutex> guard(g_mutex);
+    auto it = g_recordings.find(list);
+    if (it != g_recordings.end() && it->second && !it->second->sealed) return it->second;
+    auto rec = std::make_shared<nr::gpu::Recording>();
+    g_recordings[list] = rec;   // a sealed recording stays with whoever holds it
+    g_booked.store(true, std::memory_order_release);
+    return rec;
+}
+
+bool completed(const std::shared_ptr<nr::gpu::Recording>& rec) {
+    if (!rec) return false;                 // unknown is not complete
+    std::lock_guard<std::recursive_mutex> guard(g_mutex);
+    if (rec->strict_ready()) return true;
+    // A list kept without Reset after it ran (Recording::quiet_ready): finished, or every slot, stage and resource it
+    // used waits for it forever. Said a few times, so a log shows the game keeps its lists this way.
+    if (!rec->quiet_ready()) return false;
+    static int said = 0;
+    if (said < 3) {
+        ++said;
+        log("[nr] D3D12 passthrough: a recorded command list ran and finished but was not reset for 2 s (%s); taken as "
+            "finished", rec->sealed ? "sealed" : rec->ever_submitted ? "executed, kept by the game" : "never executed");
+    }
+    return true;
+}
+
+void note_execution(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists) {
+    std::lock_guard<std::recursive_mutex> guard(g_mutex);
+    stamp_bookings_locked(queue, count, lists);
+}
+
+void seal(const std::shared_ptr<nr::gpu::Recording>& rec) { if (rec) rec->seal(); }
+
+
+void invalidate(const std::shared_ptr<nr::gpu::Recording>& rec) {
+    if (rec) rec->seal();   // no further submissions; the waits it already has are still waited on
+}
 
 }  // namespace nr::pe::split

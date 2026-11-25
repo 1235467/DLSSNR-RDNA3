@@ -2,6 +2,7 @@
 // dlssnr-amd.ini edited in place (a value's line keeps its key and spacing, comments stay), a key table's values read
 // from and written to one section, and which [RenoDX] keys belong to the whole NR chain: NR Control's layer pages on
 // the .asi route (nr_pe_menu.cpp) and the ReShade add-on's (nr_reshade_addon.cpp).
+#include "nr_path_u8.hpp"
 #include "nr_number.hpp"
 #include "nr_pe_config.hpp"
 #include "nr_pe_log.hpp"
@@ -16,6 +17,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -32,9 +34,10 @@ class Ini {
         if (ec) return false;
         const int64_t stamp = int64_t(t.time_since_epoch().count());
         if (stamp == stamp_ && !lines_.empty()) return false;
-        std::ifstream f(path_);
+        std::ifstream f(nr::u8::path(path_));
         if (!f) return false;
         lines_.clear();
+        indexed_ = false;
         std::string l;
         while (std::getline(f, l)) {
             if (!l.empty() && l.back() == '\r') l.pop_back();
@@ -75,17 +78,14 @@ class Ini {
             size_t end = size_t(s) + 1;
             while (end < lines_.size() && !(trim(lines_[end]).rfind("[", 0) == 0)) ++end;
             lines_.insert(lines_.begin() + std::ptrdiff_t(end), key + " = " + value);
+            indexed_ = false;
         }
         dirty_ = true;
     }
     // The sections' names as written, in file order.
     std::vector<std::string> sections() const {
-        std::vector<std::string> out;
-        for (const auto& l : lines_) {
-            const std::string t = trim(l);
-            if (t.size() > 2 && t.front() == '[' && t.find(']') != std::string::npos) out.push_back(t.substr(1, t.find(']') - 1));
-        }
-        return out;
+        index();
+        return sections_;
     }
     // A section's keys and values as written (comments left out), in file order.
     std::vector<std::pair<std::string, std::string>> keys(const std::string& sec) const {
@@ -109,6 +109,7 @@ class Ini {
         const int s = find_section(from);
         if (s < 0) return;
         lines_[size_t(s)] = "[" + to + "]";
+        indexed_ = false;
         dirty_ = true;
     }
     // The section's header and lines up to the next one (a blank line before it goes too).
@@ -120,6 +121,7 @@ class Ini {
         size_t begin = size_t(s);
         if (begin > 0 && trim(lines_[begin - 1]).empty()) --begin;
         lines_.erase(lines_.begin() + std::ptrdiff_t(begin), lines_.begin() + std::ptrdiff_t(end));
+        indexed_ = false;
         dirty_ = true;
     }
     // Written whole through a temporary and a replacing move: the DLL never reads half a file.
@@ -149,27 +151,50 @@ class Ini {
         for (char& c : s) c = char(std::tolower(static_cast<unsigned char>(c)));
         return s;
     }
+    // Lookups through an index of the lines (built at the first lookup after a change): NR Control asks for its values
+    // on every frame it draws, and a scan of the whole file per value cost milliseconds a frame on the game's
+    // presenting thread. The same answers as the scans: the first header whose trimmed, lower-cased line is
+    // "[section]", and in the lines after it up to the next line starting with '[', the first key of that name.
+    void index() const {
+        if (indexed_) return;
+        headers_.clear();
+        keys_.clear();
+        sections_.clear();
+        int block = -1;
+        for (size_t i = 0; i < lines_.size(); ++i) {
+            const std::string t = trim(lines_[i]);
+            if (t.size() > 2 && t.front() == '[' && t.find(']') != std::string::npos)
+                sections_.push_back(t.substr(1, t.find(']') - 1));
+            if (t.rfind("[", 0) == 0) {
+                headers_.emplace(lower(t), int(i));   // the first of a name stays
+                block = int(i);
+                continue;
+            }
+            if (block < 0 || t.empty() || t[0] == ';' || t[0] == '#') continue;
+            const auto eq = t.find('=');
+            if (eq != std::string::npos) keys_.emplace(std::to_string(block) + '\n' + lower(trim(t.substr(0, eq))), int(i));
+        }
+        indexed_ = true;
+    }
     int find_section(const std::string& sec) const {
-        for (size_t i = 0; i < lines_.size(); ++i)
-            if (lower(trim(lines_[i])) == "[" + lower(sec) + "]") return int(i);
-        return -1;
+        index();
+        const auto it = headers_.find("[" + lower(sec) + "]");
+        return it == headers_.end() ? -1 : it->second;
     }
     int find_key(const std::string& sec, const std::string& key) const {
         const int s = find_section(sec);
         if (s < 0) return -1;
-        for (size_t i = size_t(s) + 1; i < lines_.size(); ++i) {
-            const std::string t = trim(lines_[i]);
-            if (t.rfind("[", 0) == 0) break;
-            if (t.empty() || t[0] == ';' || t[0] == '#') continue;
-            const auto eq = t.find('=');
-            if (eq != std::string::npos && lower(trim(t.substr(0, eq))) == lower(key)) return int(i);
-        }
-        return -1;
+        const auto it = keys_.find(std::to_string(s) + '\n' + lower(key));
+        return it == keys_.end() ? -1 : it->second;
     }
     std::filesystem::path path_;
     std::vector<std::string> lines_;
     int64_t stamp_ = -1;
     bool dirty_ = false;
+    mutable bool indexed_ = false;
+    mutable std::unordered_map<std::string, int> headers_;   // lower-cased trimmed header line -> its first line
+    mutable std::unordered_map<std::string, int> keys_;      // "<header line>\n<lower-cased key>" -> its first line
+    mutable std::vector<std::string> sections_;
 };
 
 // Keys of [RenoDX] that are NR Control's for every layer, or a layer's own (Enabled, Placement), so never a layer's page

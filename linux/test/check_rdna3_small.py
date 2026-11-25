@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Does the RDNA3 build still compute the small model's picture?  Run before and after any change to it.
 
-    python3 linux/test/check_rdna3_small.py --model dlssnr-small.bin           # check against the golden
-    python3 linux/test/check_rdna3_small.py --model dlssnr-small.bin --perf    # also the time per frame
-    python3 linux/test/check_rdna3_small.py --model dlssnr-small.bin --update-golden
+    python3 linux/test/check_rdna3_small.py --model CC_SMALL_FP8.bin           # check against the golden
+    python3 linux/test/check_rdna3_small.py --model CC_SMALL_FP8.bin --perf    # also the time per frame
+    python3 linux/test/check_rdna3_small.py --model CC_SMALL_FP8.bin --update-golden
 
 The small model is the 310.9.16 DLL's default (WEIGHTS_CC_SMALL_FP8: 31 blocks, 76 layers, the same layer
-families and kernels as the 310.8.0 model). --model is the dlssnr-small.bin that
-`linux/package/model-tools/extract_model.sh <nvngx_dlssnr.dll 310.9.16> <folder>` writes beside dlssnr.bin; it is
+families and kernels as the 310.8.0 model). --model is the CC_SMALL_FP8.bin that
+`linux/package/model-tools/extract_model.sh <nvngx_dlssnr.dll 310.9.16> <folder>` writes beside CC_SILVER_AARDWOLD.bin; it is
 checked against the SHA-256 of the tested model first. The shaders are the default network's.
 
 What it runs, on the first discrete GPU: the three single frames of docs/ngx-verification (1080p, 1440p, 4K)
@@ -45,12 +45,12 @@ def build(model):
                "-o", str(BUILD / "run_frame_small"), "-lvulkan", "-lpthread"])
     run(cxx + ["linux/src/core/nr_graph.cpp", "-o", str(BUILD / "nr_graph_small"), "-lvulkan"])
     run(cxx + ["linux/test/mkplan.cpp", "linux/src/core/nr_native_plan.cpp", "-o", str(BUILD / "mkplan_small")])
-    # the tree an installed small model has: the default network's shaders and dlssnr-small.bin
+    # the tree an installed small model has: the default network's shaders and CC_SMALL_FP8.bin
     data = INST / "dlssnr-amd"
     shutil.rmtree(INST, ignore_errors=True)
     data.mkdir(parents=True)
     shutil.copytree(ROOT / "build" / "linux" / "rdna3" / "network", data / "shaders")
-    shutil.copyfile(model, data / "dlssnr-small.bin")
+    shutil.copyfile(model, data / "CC_SMALL_FP8.bin")
 
 
 def run_frame(name, in_path, out_path, timed=0):
@@ -112,7 +112,7 @@ def layer_hashes():
     rgba = np.fromfile(BUILD / "in_1080p.rgba8", np.uint8).reshape(-1, 4).astype(np.float32) / 255
     blob = BUILD / "in_1080p.f32"
     rgba.tofile(blob)
-    out = run([str(BUILD / "nr_graph_small"), "--plan", str(plan), "--model-pack", str(INST / "dlssnr-amd" / "dlssnr-small.bin"),
+    out = run([str(BUILD / "nr_graph_small"), "--plan", str(plan), "--model-pack", str(INST / "dlssnr-amd" / "CC_SMALL_FP8.bin"),
                "--spv-dir", str(INST / "dlssnr-amd" / "shaders"), "--host-boundary", "--no-reuse",
                "--source-width", str(w), "--source-height", str(h), "--in-image", str(blob), "--value-stats"])
     import re
@@ -141,7 +141,7 @@ def check_layers(golden_rows, record):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--model", required=True, help="dlssnr-small.bin")
+    ap.add_argument("--model", required=True, help="CC_SMALL_FP8.bin")
     ap.add_argument("--update-golden", action="store_true")
     ap.add_argument("--perf", type=int, nargs="?", const=20, default=0, help="also time N passes per frame (default 20)")
     ap.add_argument("--skip-build", action="store_true")

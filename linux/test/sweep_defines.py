@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Rebuild some pipelines of the RDNA3 network with other defines and time them, without the full check.
 
-    python3 linux/test/sweep_defines.py --model dlssnr.bin fswinpds64,fswinpup64 NR_EXPAND_KLOOP=[[dont_unroll]]
-    python3 linux/test/sweep_defines.py --model dlssnr.bin fswin32nh NR_FWAVES=4 --resolution 1080p
+    python3 linux/test/sweep_defines.py --model CC_SILVER_AARDWOLD.bin fswinpds64,fswinpup64 NR_EXPAND_KLOOP=[[dont_unroll]]
+    python3 linux/test/sweep_defines.py --model CC_SILVER_AARDWOLD.bin fswin32nh NR_FWAVES=4 --resolution 1080p
 
 The named pipelines of pipelines.json are compiled with the extra defines (an extra define replaces the
 table's define of the same name), copied over a copy of the built network, and nr_graph --per-layer prints

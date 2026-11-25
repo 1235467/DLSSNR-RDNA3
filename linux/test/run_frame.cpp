@@ -2,7 +2,7 @@
 //
 // One network pass through nr::Runtime on the first discrete GPU, the way a game calls it: an
 // 8-bit RGBA frame in, the defaults of nr::Controls, an 8-bit frame out. <root> holds
-// dlssnr-amd/{shaders,dlssnr.bin} (the installed layout). The saved output is the second pass,
+// dlssnr-amd/{shaders,CC_SILVER_AARDWOLD.bin} (the installed layout). The saved output is the second pass,
 // on a re-uploaded input, so the cold first pass (pipeline compilation) is never compared.
 // With timed passes, prints the mean wall time of a submitted pass over them.
 // RUN_FRAME_FORMAT=fp16 hands the runtime the frame as R16G16B16A16_SFLOAT with sampled and storage
